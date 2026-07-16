@@ -17,6 +17,7 @@ LINE 英文小助手
 
 import os
 import re
+import time
 import json
 import random
 import datetime
@@ -60,15 +61,16 @@ tw_time = lambda: datetime.datetime.now(TW).strftime("%H:%M")
 
 
 # ---------- 試算表 (呼叫 Apps Script) ----------
-def sheet_call(payload: dict):
+def sheet_call(payload: dict, retries: int = 2):
     if not SHEET_URL or not SHEET_TOKEN:
         return None
-    try:
-        payload["token"] = SHEET_TOKEN
-        return requests.post(SHEET_URL, json=payload, timeout=20).json()
-    except Exception as e:
-        print("sheet_call error:", e)
-        return None
+    payload["token"] = SHEET_TOKEN
+    for attempt in range(retries + 1):
+        try:
+            return requests.post(SHEET_URL, json=payload, timeout=30).json()
+        except Exception as e:
+            print(f"sheet_call error (try {attempt + 1}):", e)
+    return None
 
 
 def norm_date(v) -> str:
@@ -111,14 +113,23 @@ def set_state(user, mode, pending=""):
 
 # ---------- Gemini ----------
 def ask_gemini(system_prompt: str, user_text: str, temp=0.7) -> str:
-    try:
-        resp = gemini.models.generate_content(
-            model=MODEL, contents=user_text,
-            config=types.GenerateContentConfig(system_instruction=system_prompt, temperature=temp),
-        )
-        return (resp.text or "").strip() or "（沒有回傳內容，再試一次）"
-    except Exception as e:
-        return f"⚠️ 呼叫 Gemini 失敗：{e}"
+    last = ""
+    for attempt in range(3):
+        try:
+            resp = gemini.models.generate_content(
+                model=MODEL, contents=user_text,
+                config=types.GenerateContentConfig(system_instruction=system_prompt, temperature=temp),
+            )
+            return (resp.text or "").strip() or "（沒有回傳內容，再試一次）"
+        except Exception as e:
+            last = str(e)
+            transient = any(k in last for k in
+                            ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "overloaded", "high demand"))
+            if transient and attempt < 2:
+                time.sleep(1.5)
+                continue
+            break
+    return f"⚠️ 呼叫 Gemini 失敗：{last}"
 
 
 SHORT = "回答精簡、適合手機閱讀，最多 6 行，不要長篇大論。"
@@ -131,27 +142,89 @@ VOCAB_ONE = ("你是多益單字老師，出一個多益中高頻單字。格式
 MEANING = "你是英漢字典，只回覆這個英文單字最常用的繁體中文意思，最多10字，不要例句詞性。"
 
 
-# ---------- 模式：教學 / 文法 ----------
-def vocab_teach(user, user_text):
-    known = [r["word"] for r in list_words(user)][-60:]
+def parse_json(s):
+    try:
+        return json.loads(s) if s else {}
+    except Exception:
+        return {}
+
+
+def extract_int(s):
+    m = re.search(r"\d+", s)
+    return int(m.group()) if m else None
+
+
+# ---------- 模式：學習計畫（教學）----------
+def enter_plan(user):
+    """打『教學』：有計畫就接著教下一個，沒計畫就開始問主題。"""
+    mode, pending = get_state(user)
+    if mode == "plan":
+        plan = parse_json(pending)
+        if plan.get("theme"):
+            return plan_continue(user, plan)
+    set_state(user, "setup", json.dumps({"step": "theme"}))
+    return ("📚 我們來排個學習計畫！\n"
+            "你想學什麼主題或方向？例如：\n"
+            "• 出國旅遊　• 商業 email　• 面試英文\n"
+            "• 字首 pre-　• 多益高頻字\n\n"
+            "直接打你想學的主題 👇")
+
+
+def handle_setup(user, text, pending):
+    st = parse_json(pending)
+    if st.get("step") == "theme":
+        theme = text.strip()
+        set_state(user, "setup", json.dumps({"step": "count", "theme": theme}))
+        return f"好！主題就設定為【{theme}】。\n一天想學幾個單字呢？打數字就好（例如 5）👇"
+    if st.get("step") == "count":
+        n = extract_int(text)
+        if not n:
+            return "請打一個數字，例如 5 🙂"
+        n = max(1, min(n, 20))
+        theme = st.get("theme", "多益高頻字")
+        plan = {"theme": theme, "count": n, "date": tw_today(), "done": 0}
+        set_state(user, "plan", json.dumps(plan))
+        first = teach_plan_word(user, plan)
+        return (f"📚 開始學【{theme}】，每天 {n} 個！\n"
+                f"學完打「繼續」接下一個；隔天也是打「繼續」，主題會一直記住不會亂跳。\n"
+                f"想換主題打「換主題」。\n\n{first}")
+
+
+def teach_plan_word(user, plan):
+    """依主題教下一個沒學過的單字、自動記錄、更新今日進度。"""
+    known = [r["word"] for r in list_words(user)][-100:]
     avoid = "、".join(known) if known else "（無）"
+    theme = plan["theme"]
     sys = (
-        "你是多益單字老師。使用者若指定某個單字就教那個，否則教一個新的多益中高頻單字，"
-        f"避開這些學過的字：{avoid}。\n"
-        "嚴格照這個格式輸出，第一行是給程式讀的資料，之後才是給人看的：\n"
-        "DATA: 英文單字|中文意思\n"
-        "📖 單字 (詞性) 中文\n例句：一句英文（附中譯）\n一句超簡短用法或記憶提示。\n"
-        "整體最多 5 行。"
+        f"你是多益單字老師，正在帶學生用「{theme}」這個主題循序漸進學單字，"
+        "由常用到少用、由易到難，一次教一個。"
+        f"避開這些已經學過的字：{avoid}。\n"
+        "嚴格照格式輸出，第一行給程式讀，其餘給人看（把角括號換成實際內容）：\n"
+        "DATA: <英文單字>|<中文意思>\n"
+        "📖 <英文單字> (詞性) <中文意思>\n例句：一句英文（附中譯）\n一句超簡短用法或記憶點。最多 5 行。"
     )
-    out = ask_gemini(sys, user_text or "教我一個新單字")
-    # 解析第一行 DATA: word|meaning 來自動記錄
+    out = ask_gemini(sys, f"主題：{theme}，教下一個單字")
+    if out.startswith("⚠️"):   # Gemini 暫時失敗：不計進度，讓使用者再試
+        return "⚠️ 剛剛系統有點忙，沒抓到單字，請再打一次「繼續」🙏"
     m = re.search(r"DATA:\s*(.+?)\|(.+)", out)
     shown = re.sub(r"^DATA:.*\n?", "", out, count=1).strip()
     if m:
-        word, meaning = m.group(1).strip(), m.group(2).strip()
-        record_word(user, word, meaning)
-        return f"{shown}\n\n✅ 已幫你記錄「{word}」（打「考試」可複習）"
-    return shown or out
+        record_word(user, m.group(1).strip(), m.group(2).strip())
+    plan["done"] = plan.get("done", 0) + 1
+    set_state(user, "plan", json.dumps(plan))
+    return f"{shown}\n\n（今天第 {plan['done']}/{plan['count']} 個）學完打「繼續」"
+
+
+def plan_continue(user, plan, force=False):
+    if plan.get("date") != tw_today():   # 新的一天：主題不變，只把今日進度歸零
+        plan["date"] = tw_today()
+        plan["done"] = 0
+        set_state(user, "plan", json.dumps(plan))
+    if plan.get("done", 0) >= plan["count"] and not force:
+        return (f"🎉 今天【{plan['theme']}】的 {plan['count']} 個單字學完了！\n"
+                f"明天打「繼續」接著學；想現在多學就打「更多」。\n"
+                f"（打「考試」可以測驗今天學的字）")
+    return teach_plan_word(user, plan)
 
 
 def grammar_teach(user_text):
@@ -241,9 +314,10 @@ def cmd_review(user):
 
 HELP = (
     "🔤 模式（打這些字切換，會記住）：\n"
-    "• 教學 → 教你單字並自動記錄\n"
+    "• 教學 → 排學習計畫，照主題每天教你單字\n"
+    "　（打「繼續」學下一個、「換主題」換方向）\n"
     "• 文法 → 文法教學\n"
-    "• 考試 → 用你記過的單字考你計分\n"
+    "• 考試 → 用你學過的單字考你計分\n"
     "• 聊天 → 一般家教\n\n"
     "⚡ 指令（隨時可用）：\n"
     "• /翻譯 句子　• /文法 句子　• /單字\n"
@@ -253,24 +327,28 @@ HELP = (
 
 WELCOME = (
     "👋 歡迎使用「多益學習小助手」！\n"
-    "我能陪你背單字、學文法、考試，還會自動記錄你學過的字 📚\n\n"
+    "我會幫你排學習計畫、照主題每天教你單字，還會自動記錄、幫你考試 📚\n\n"
     "🔤 打這些字切換模式（會記住）：\n"
-    "• 教學 → 我教你單字並自動記錄\n"
+    "• 教學 → 排計畫學單字（我先問你主題和一天幾個）\n"
     "• 文法 → 教你多益文法\n"
-    "• 考試 → 用你記過的字考你、算分\n"
+    "• 考試 → 用你學過的字考你、算分\n"
     "• 聊天 → 一般英文家教，什麼都能問\n\n"
-    "⚡ 常用指令：\n"
-    "• /翻譯 句子　• /單字　• /今天　• /複習\n\n"
-    "💡 現在就打「教學」開始背第一個單字吧！\n"
-    "（隨時打「選單」可再看到說明）"
+    "🔁 學單字時：打「繼續」接下一個、「換主題」換方向\n"
+    "⚡ 指令：/翻譯 句子　/單字　/今天　/複習\n\n"
+    "💡 現在就打「教學」開始排你的計畫吧！\n"
+    "（隨時打「選單」看說明）"
 )
 
 SWITCH = {
-    "vocab": {"教學", "背單字", "單字模式", "單字教學"},
     "grammar": {"文法", "文法模式", "學文法"},
     "exam": {"考試", "測驗", "考我"},
     "chat": {"聊天", "一般", "回家教", "家教"},
 }
+
+PLAN_ENTER = {"教學", "學單字", "背單字", "單字教學", "計畫", "學習計畫", "排課"}
+PLAN_NEXT = {"繼續", "下一個", "next", "繼續學", "再一個"}
+PLAN_MORE = {"更多", "多學", "再多一個", "加碼"}
+PLAN_RESET = {"換主題", "重新設定", "換方向", "重設計畫"}
 
 
 # ---------- 路由 ----------
@@ -297,27 +375,44 @@ def route(text, user):
     if s in ("選單", "開始", "menu", "使用說明", "怎麼用"):
         return WELCOME
 
-    # 2) 模式切換（整句剛好是關鍵字才切換）
+    # 2) 進入學習計畫（教學）
+    if s in PLAN_ENTER:
+        return enter_plan(user)
+
+    # 3) 模式切換（整句剛好是關鍵字才切換）
     for mode, kws in SWITCH.items():
         if s in kws:
             if mode == "exam":
                 return start_exam(user)
             set_state(user, mode, "")
-            names = {"vocab": "單字教學", "grammar": "文法教學", "chat": "一般家教"}
-            tip = {"vocab": "直接打任何字我就教你新單字，或打某個單字教那個。",
-                   "grammar": "貼一句英文我幫你看文法，或打「下一個」教你新重點。",
+            names = {"grammar": "文法教學", "chat": "一般家教"}
+            tip = {"grammar": "貼一句英文我幫你看文法，或打「下一個」教你新重點。",
                    "chat": "有什麼英文問題都可以問我。"}[mode]
-            return f"已切換到「{names[mode]}」模式 ✅\n{tip}\n（打「考試」或「文法」等可再切換）"
+            return f"已切換到「{names[mode]}」模式 ✅\n{tip}\n（打「教學」「考試」等可再切換）"
 
-    # 3) 依目前模式處理
+    # 4) 依目前模式處理
     mode, pending = get_state(user)
+
+    if mode == "setup":
+        return handle_setup(user, s, pending)
 
     if mode == "exam":
         if s in ("結束", "停", "stop", "退出"):
             return end_exam(user, pending)
         return exam_answer(user, s, pending)
-    if mode == "vocab":
-        return vocab_teach(user, s)
+
+    if mode == "plan":
+        plan = parse_json(pending)
+        if s in PLAN_RESET:
+            set_state(user, "setup", json.dumps({"step": "theme"}))
+            return "好，換主題！告訴我新的主題或方向（例如：出國旅遊 / 字首 pre-）👇"
+        if s in PLAN_MORE:
+            return plan_continue(user, plan, force=True)
+        return plan_continue(user, plan)   # 繼續 或其他任何輸入 → 教下一個
+
+    if s in PLAN_NEXT or s in PLAN_MORE or s in PLAN_RESET:
+        return "你還沒有學習計畫，打「教學」開始排一個 📚"
+
     if mode == "grammar":
         return grammar_teach(s)
     return ask_gemini(TUTOR, s)  # chat
