@@ -3,5 +3,4 @@ gunicorn
 line-bot-sdk
 google-genai
 python-dotenv
-gspread
-google-auth
+requests

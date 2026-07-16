@@ -1,27 +1,29 @@
 """
-LINE 英文小助手 (翻譯 / 多益文法 / 單字練習 / 單字記錄)
-- LINE Messaging API (Reply 模式，使用者先傳你才回 → 免費)
-- Google Gemini API (免費 tier, gemini-2.5-flash)
-- Google 試算表 (記錄每天學的單字，可隨時打開複習)
+LINE 英文小助手
+- LINE Messaging API (Reply 模式，免費)
+- Google Gemini (gemini-2.5-flash)
+- Google 試算表 (透過 Apps Script Web App 存單字與狀態)
 
-指令:
-    /翻譯 <句子>       翻譯並解釋
-    /文法 <句子>       針對句子講一個多益常考文法點
-    /單字              出一個多益風格單字 + 例句 + 小測驗
-    /記 <單字> [中文]  記錄一個單字 (沒填中文會自動查)
-    /今天              看今天記錄了哪些單字
-    /複習              從你記過的單字裡隨機抽一個考你
-    其他任何訊息        當一般英文家教對話
+模式 (打這些字切換，會被記住)：
+    教學 / 背單字     → 單字教學模式 (教你單字並自動記錄，避開學過的)
+    文法             → 文法教學模式
+    考試             → 考試模式 (用你記過的單字考你、計分)
+    聊天 / 結束       → 一般家教模式
+
+指令 (任何模式都能用)：
+    /翻譯 <句子>   /文法 <句子>   /單字
+    /記 <單字> [中文]   /今天   /複習   /help
 """
 
 import os
+import re
 import json
 import random
 import datetime
 
+import requests
 from flask import Flask, request, abort
 
-# 本機開發時從 .env 讀金鑰 (雲端上會用平台的環境變數，沒有 .env 也不會報錯)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -31,11 +33,7 @@ except ImportError:
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
-    Configuration,
-    ApiClient,
-    MessagingApi,
-    ReplyMessageRequest,
-    TextMessage,
+    Configuration, ApiClient, MessagingApi, ReplyMessageRequest, TextMessage,
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
@@ -43,206 +41,269 @@ from google import genai
 from google.genai import types
 
 
-# ---------- 讀取金鑰 ----------
+# ---------- 金鑰 / 設定 ----------
 LINE_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 LINE_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
-
-# Google 試算表 (選用；沒設定時記錄類指令會提示尚未設定)
-GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
-GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+SHEET_URL = os.environ.get("SHEET_WEBAPP_URL")
+SHEET_TOKEN = os.environ.get("SHEET_TOKEN")
 
 app = Flask(__name__)
 configuration = Configuration(access_token=LINE_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
 gemini = genai.Client(api_key=GEMINI_KEY)
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")  # lite 免費每日額度大很多
 
-MODEL = "gemini-2.5-flash"
-
-# 台灣時區 (Render 伺服器是 UTC，要 +8 才是台灣的「今天」)
 TW = datetime.timezone(datetime.timedelta(hours=8))
+tw_today = lambda: datetime.datetime.now(TW).date().isoformat()
+tw_time = lambda: datetime.datetime.now(TW).strftime("%H:%M")
 
 
-def tw_today() -> str:
-    return datetime.datetime.now(TW).date().isoformat()
-
-
-def tw_time() -> str:
-    return datetime.datetime.now(TW).strftime("%H:%M")
-
-
-# ---------- Google 試算表 ----------
-_worksheet = None
-
-
-def get_sheet():
-    """回傳試算表工作表；沒設定或連不上時回 None。"""
-    global _worksheet
-    if _worksheet is not None:
-        return _worksheet
-    if not GOOGLE_SHEET_ID or not GOOGLE_CREDENTIALS_JSON:
+# ---------- 試算表 (呼叫 Apps Script) ----------
+def sheet_call(payload: dict):
+    if not SHEET_URL or not SHEET_TOKEN:
         return None
     try:
-        import gspread
-        from google.oauth2.service_account import Credentials
-
-        creds = Credentials.from_service_account_info(
-            json.loads(GOOGLE_CREDENTIALS_JSON),
-            scopes=["https://www.googleapis.com/auth/spreadsheets"],
-        )
-        _worksheet = gspread.authorize(creds).open_by_key(GOOGLE_SHEET_ID).sheet1
-        return _worksheet
+        payload["token"] = SHEET_TOKEN
+        return requests.post(SHEET_URL, json=payload, timeout=20).json()
     except Exception as e:
-        print("Google 試算表連線失敗：", e)
+        print("sheet_call error:", e)
         return None
 
 
-def my_rows(sheet, user_id: str):
-    """回傳這個使用者記過的所有單字列 [日期, 單字, 中文, 時間, user_id]。"""
-    rows = sheet.get_all_values()
-    return [r for r in rows if len(r) >= 5 and r[4] == user_id]
+def norm_date(v) -> str:
+    """試算表可能把日期回成 ISO 時間字串，統一轉回台灣的 YYYY-MM-DD。"""
+    s = str(v)
+    if "T" in s:
+        try:
+            dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(TW)
+            return dt.date().isoformat()
+        except Exception:
+            return s[:10]
+    return s[:10]
 
 
-# ---------- 呼叫 Gemini ----------
-def ask_gemini(system_prompt: str, user_text: str) -> str:
+def record_word(user, word, meaning):
+    return sheet_call({"action": "record", "user": user, "word": word,
+                       "meaning": meaning, "date": tw_today(), "time": tw_time()})
+
+
+def list_words(user):
+    res = sheet_call({"action": "list", "user": user})
+    if not res or not res.get("ok"):
+        return []
+    rows = res.get("rows", [])
+    for r in rows:
+        r["date"] = norm_date(r.get("date", ""))
+    return rows
+
+
+def get_state(user):
+    res = sheet_call({"action": "getstate", "user": user})
+    if not res or not res.get("ok"):
+        return "chat", ""
+    return (res.get("mode") or "chat"), (res.get("pending") or "")
+
+
+def set_state(user, mode, pending=""):
+    sheet_call({"action": "setstate", "user": user, "mode": mode, "pending": pending})
+
+
+# ---------- Gemini ----------
+def ask_gemini(system_prompt: str, user_text: str, temp=0.7) -> str:
     try:
         resp = gemini.models.generate_content(
-            model=MODEL,
-            contents=user_text,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                temperature=0.7,
-            ),
+            model=MODEL, contents=user_text,
+            config=types.GenerateContentConfig(system_instruction=system_prompt, temperature=temp),
         )
-        return (resp.text or "").strip() or "（Gemini 沒有回傳內容，再試一次）"
+        return (resp.text or "").strip() or "（沒有回傳內容，再試一次）"
     except Exception as e:
         return f"⚠️ 呼叫 Gemini 失敗：{e}"
 
 
-# ---------- 各種模式的 system prompt ----------
-TUTOR = (
-    "你是一位親切但專業的多益(TOEIC)英文家教，對象是台灣的中級學習者。"
-    "用繁體中文說明，英文例句保留英文。回答精簡、重點條列，適合在手機上看。"
-)
+SHORT = "回答精簡、適合手機閱讀，最多 6 行，不要長篇大論。"
 
-TRANSLATE = (
-    "你是英文翻譯老師。使用者給你一段文字：若是中文就翻成自然的英文，若是英文就翻成中文。"
-    "格式：先給翻譯結果，再用繁體中文條列 1~2 個值得注意的用字或文法點。保持精簡。"
-)
-
-GRAMMAR = (
-    "你是多益文法老師。針對使用者給的英文句子，挑出「一個」多益最常考的文法重點來講解"
-    "（例如時態、介系詞、主動被動、關係代名詞等）。用繁體中文，先點出重點名稱，"
-    "再簡短說明並給一個對照例句。若句子有錯也順便指出正確寫法。"
-)
-
-VOCAB = (
-    "你是多益單字老師。隨機出一個多益常見的中高頻單字，格式如下（用繁體中文）：\n"
-    "📖 單字：word (詞性)\n"
-    "意思：...\n"
-    "例句：一句英文例句 + 中文翻譯\n"
-    "🧠 小測驗：造一個克漏字句子，把該單字挖空，並在最後用『（答案：word）』附上答案。"
-)
-
-MEANING = (
-    "你是英漢字典。使用者給你一個英文單字，只回覆它最常用的繁體中文意思，"
-    "越簡短越好（最多 10 個字），不要例句、不要詞性、不要任何多餘的字。"
-)
+TUTOR = f"你是親切的多益英文家教，對象是台灣中級學習者。用繁體中文說明，英文保留英文。{SHORT}"
+TRANSLATE = f"你是翻譯老師。中文就翻成自然英文、英文就翻成中文，翻完用中文點 1 個重點。{SHORT}"
+GRAMMAR_ONE = f"你是多益文法老師，針對使用者的句子挑一個最常考的文法點簡短講解，有錯就指出正確寫法。{SHORT}"
+VOCAB_ONE = ("你是多益單字老師，出一個多益中高頻單字。格式：\n📖 word (詞性) 中文\n例句：英文（中譯）\n"
+             "🧠 克漏字一句，挖空該字，最後附『（答案：word）』。精簡。")
+MEANING = "你是英漢字典，只回覆這個英文單字最常用的繁體中文意思，最多10字，不要例句詞性。"
 
 
-# ---------- 單字記錄指令 ----------
-def cmd_record(user_id: str, body: str) -> str:
-    sheet = get_sheet()
-    if sheet is None:
-        return "⚠️ 還沒設定好 Google 試算表，暫時無法記錄單字。"
+# ---------- 模式：教學 / 文法 ----------
+def vocab_teach(user, user_text):
+    known = [r["word"] for r in list_words(user)][-60:]
+    avoid = "、".join(known) if known else "（無）"
+    sys = (
+        "你是多益單字老師。使用者若指定某個單字就教那個，否則教一個新的多益中高頻單字，"
+        f"避開這些學過的字：{avoid}。\n"
+        "嚴格照這個格式輸出，第一行是給程式讀的資料，之後才是給人看的：\n"
+        "DATA: 英文單字|中文意思\n"
+        "📖 單字 (詞性) 中文\n例句：一句英文（附中譯）\n一句超簡短用法或記憶提示。\n"
+        "整體最多 5 行。"
+    )
+    out = ask_gemini(sys, user_text or "教我一個新單字")
+    # 解析第一行 DATA: word|meaning 來自動記錄
+    m = re.search(r"DATA:\s*(.+?)\|(.+)", out)
+    shown = re.sub(r"^DATA:.*\n?", "", out, count=1).strip()
+    if m:
+        word, meaning = m.group(1).strip(), m.group(2).strip()
+        record_word(user, word, meaning)
+        return f"{shown}\n\n✅ 已幫你記錄「{word}」（打「考試」可複習）"
+    return shown or out
+
+
+def grammar_teach(user_text):
+    sys = ("你是多益文法老師。使用者給句子就講解該句最常考的一個文法點並修正錯誤；"
+           f"若只是說「下一個」或沒給句子，就教一個多益常考文法重點並給例句。{SHORT}")
+    return ask_gemini(sys, user_text or "教我一個文法重點")
+
+
+# ---------- 模式：考試 ----------
+def next_question(user, score, n):
+    words = list_words(user)
+    r = random.choice(words)
+    pending = json.dumps({"answer": r["word"], "meaning": r["meaning"], "score": score, "n": n})
+    return pending, f'Q{n + 1}：「{r["meaning"]}」的英文是？'
+
+
+def start_exam(user):
+    if not list_words(user):
+        set_state(user, "chat", "")
+        return "考試需要先有記錄的單字。先打「教學」學幾個，或用 /記 新增，再來考試 📖"
+    pending, q = next_question(user, 0, 0)
+    set_state(user, "exam", pending)
+    return "📝 考試開始！答錯沒關係，打「結束」可以停。\n\n" + q
+
+
+def exam_answer(user, text, pending):
+    try:
+        st = json.loads(pending)
+    except Exception:
+        return start_exam(user)
+    ans, meaning = st["answer"], st["meaning"]
+    score, n = st["score"], st["n"]
+    n += 1
+    if text.strip().lower() == ans.strip().lower():
+        score += 1
+        fb = f"✅ 答對！{ans}（{meaning}）"
+    else:
+        fb = f"❌ 答案是 {ans}（{meaning}）"
+    pending, q = next_question(user, score, n)
+    set_state(user, "exam", pending)
+    return f"{fb}\n目前 {score}/{n} 分\n\n{q}"
+
+
+def end_exam(user, pending):
+    try:
+        st = json.loads(pending)
+        score, n = st["score"], st["n"]
+    except Exception:
+        score, n = 0, 0
+    set_state(user, "chat", "")
+    if n == 0:
+        return "考試結束，回到一般模式 🙂"
+    return f"🏁 考試結束！你答對 {score}/{n} 題。回到一般模式，隨時打「考試」再來一輪。"
+
+
+# ---------- 記錄類指令 ----------
+def cmd_record(user, body):
+    if not SHEET_URL:
+        return "⚠️ 還沒設定好試算表。"
     if not body:
-        return "用法：/記 單字 中文\n例如：/記 procrastinate 拖延\n（中文可省略，我會自動幫你查）"
-
+        return "用法：/記 單字 中文（中文可省略，我會自動查）\n例如：/記 procrastinate 拖延"
     parts = body.split(maxsplit=1)
     word = parts[0]
-    if len(parts) > 1:
-        meaning = parts[1].strip()
-    else:
-        meaning = ask_gemini(MEANING, word)  # 沒給中文就自動查
-
-    try:
-        sheet.append_row([tw_today(), word, meaning, tw_time(), user_id])
-    except Exception as e:
-        return f"⚠️ 寫入試算表失敗：{e}"
-
-    today_count = sum(1 for r in my_rows(sheet, user_id) if r[0] == tw_today())
-    return f"✅ 已記錄！{word}（{meaning}）\n今天是你的第 {today_count} 個單字 💪"
+    meaning = parts[1].strip() if len(parts) > 1 else ask_gemini(MEANING, word)
+    res = record_word(user, word, meaning)
+    if not res or not res.get("ok"):
+        return "⚠️ 寫入試算表失敗，稍後再試。"
+    today_n = sum(1 for r in list_words(user) if r["date"] == tw_today())
+    return f"✅ 已記錄！{word}（{meaning}）\n今天第 {today_n} 個單字 💪"
 
 
-def cmd_today(user_id: str) -> str:
-    sheet = get_sheet()
-    if sheet is None:
-        return "⚠️ 還沒設定好 Google 試算表。"
-    today = tw_today()
-    words = [r for r in my_rows(sheet, user_id) if r[0] == today]
+def cmd_today(user):
+    words = [r for r in list_words(user) if r["date"] == tw_today()]
     if not words:
-        return "今天還沒記錄單字喔！用「/記 單字 中文」開始吧 📖"
-    lines = [f"{i}. {r[1]}（{r[2]}）" for i, r in enumerate(words, 1)]
-    return f"📅 今天你記了 {len(words)} 個單字：\n" + "\n".join(lines)
+        return "今天還沒記單字，打「教學」或用 /記 開始吧 📖"
+    lines = [f'{i}. {r["word"]}（{r["meaning"]}）' for i, r in enumerate(words, 1)]
+    return f"📅 今天記了 {len(words)} 個：\n" + "\n".join(lines)
 
 
-def cmd_review(user_id: str) -> str:
-    sheet = get_sheet()
-    if sheet is None:
-        return "⚠️ 還沒設定好 Google 試算表。"
-    words = my_rows(sheet, user_id)
+def cmd_review(user):
+    words = list_words(user)
     if not words:
-        return "你還沒記錄任何單字，先用「/記 單字 中文」累積一些吧！"
+        return "還沒有記錄的單字，先學幾個吧！"
     r = random.choice(words)
-    return (
-        "🧠 複習時間！還記得這個中文對應的英文單字嗎？\n\n"
-        f"「{r[2]}」\n\n"
-        f"（答案：{r[1]}　—　{r[0]} 記錄的）"
-    )
+    return f'🧠 複習：「{r["meaning"]}」的英文是？\n\n（答案：{r["word"]}）'
 
 
-# ---------- 指令路由 ----------
-def route(text: str, user_id: str) -> str:
-    stripped = text.strip()
+HELP = (
+    "🔤 模式（打這些字切換，會記住）：\n"
+    "• 教學 → 教你單字並自動記錄\n"
+    "• 文法 → 文法教學\n"
+    "• 考試 → 用你記過的單字考你計分\n"
+    "• 聊天 → 一般家教\n\n"
+    "⚡ 指令（隨時可用）：\n"
+    "• /翻譯 句子　• /文法 句子　• /單字\n"
+    "• /記 單字 中文　• /今天　• /複習"
+)
 
-    if stripped.startswith("/翻譯"):
-        body = stripped[3:].strip()
-        if not body:
-            return "用法：/翻譯 你想翻譯的句子"
-        return ask_gemini(TRANSLATE, body)
+SWITCH = {
+    "vocab": {"教學", "背單字", "單字模式", "單字教學"},
+    "grammar": {"文法", "文法模式", "學文法"},
+    "exam": {"考試", "測驗", "考我"},
+    "chat": {"聊天", "一般", "回家教", "家教"},
+}
 
-    if stripped.startswith("/文法"):
-        body = stripped[3:].strip()
-        if not body:
-            return "用法：/文法 一句英文，我幫你看文法重點"
-        return ask_gemini(GRAMMAR, body)
 
-    if stripped.startswith("/單字"):
-        return ask_gemini(VOCAB, "出一題")
+# ---------- 路由 ----------
+def route(text, user):
+    s = text.strip()
 
-    if stripped.startswith("/記"):
-        return cmd_record(user_id, stripped[2:].strip())
+    # 1) 斜線指令：任何模式都能用
+    if s.startswith("/翻譯"):
+        b = s[3:].strip()
+        return ask_gemini(TRANSLATE, b) if b else "用法：/翻譯 你想翻譯的句子"
+    if s.startswith("/文法"):
+        b = s[3:].strip()
+        return ask_gemini(GRAMMAR_ONE, b) if b else "用法：/文法 一句英文"
+    if s.startswith("/單字"):
+        return ask_gemini(VOCAB_ONE, "出一題")
+    if s.startswith("/記"):
+        return cmd_record(user, s[2:].strip())
+    if s.startswith("/今天"):
+        return cmd_today(user)
+    if s.startswith("/複習"):
+        return cmd_review(user)
+    if s in ("/help", "/說明", "help", "?"):
+        return HELP
 
-    if stripped.startswith("/今天"):
-        return cmd_today(user_id)
+    # 2) 模式切換（整句剛好是關鍵字才切換）
+    for mode, kws in SWITCH.items():
+        if s in kws:
+            if mode == "exam":
+                return start_exam(user)
+            set_state(user, mode, "")
+            names = {"vocab": "單字教學", "grammar": "文法教學", "chat": "一般家教"}
+            tip = {"vocab": "直接打任何字我就教你新單字，或打某個單字教那個。",
+                   "grammar": "貼一句英文我幫你看文法，或打「下一個」教你新重點。",
+                   "chat": "有什麼英文問題都可以問我。"}[mode]
+            return f"已切換到「{names[mode]}」模式 ✅\n{tip}\n（打「考試」或「文法」等可再切換）"
 
-    if stripped.startswith("/複習"):
-        return cmd_review(user_id)
+    # 3) 依目前模式處理
+    mode, pending = get_state(user)
 
-    if stripped in ("/help", "/說明", "help", "?"):
-        return (
-            "我可以幫你：\n"
-            "• /翻譯 <句子> → 翻譯 + 重點\n"
-            "• /文法 <句子> → 講一個多益文法點\n"
-            "• /單字 → 出一個單字練習\n"
-            "• /記 <單字> <中文> → 記錄單字\n"
-            "• /今天 → 看今天記了哪些單字\n"
-            "• /複習 → 隨機抽考你記過的單字\n"
-            "• 直接打任何問題 → 當英文家教聊"
-        )
-
-    # 沒有指令 → 當一般家教
-    return ask_gemini(TUTOR, stripped)
+    if mode == "exam":
+        if s in ("結束", "停", "stop", "退出"):
+            return end_exam(user, pending)
+        return exam_answer(user, s, pending)
+    if mode == "vocab":
+        return vocab_teach(user, s)
+    if mode == "grammar":
+        return grammar_teach(s)
+    return ask_gemini(TUTOR, s)  # chat
 
 
 # ---------- LINE Webhook ----------
@@ -263,19 +324,16 @@ def on_message(event):
     reply = route(event.message.text, user_id)
     with ApiClient(configuration) as api_client:
         MessagingApi(api_client).reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text=reply)],
-            )
+            ReplyMessageRequest(reply_token=event.reply_token,
+                                messages=[TextMessage(text=reply)])
         )
 
 
-# 給 Render / 瀏覽器確認服務活著用
 @app.route("/")
 def health():
     return "LINE English Bot is running."
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5001))  # 5001 避開你股票網站的 5000
+    port = int(os.environ.get("PORT", 5001))
     app.run(host="0.0.0.0", port=port)
