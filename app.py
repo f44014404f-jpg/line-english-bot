@@ -35,7 +35,7 @@ from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi, ReplyMessageRequest, TextMessage,
 )
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from linebot.v3.webhooks import MessageEvent, TextMessageContent, FollowEvent
 
 from google import genai
 from google.genai import types
@@ -247,7 +247,22 @@ HELP = (
     "• 聊天 → 一般家教\n\n"
     "⚡ 指令（隨時可用）：\n"
     "• /翻譯 句子　• /文法 句子　• /單字\n"
-    "• /記 單字 中文　• /今天　• /複習"
+    "• /記 單字 中文　• /今天　• /複習\n\n"
+    "💡 隨時打「選單」可再看到這份說明。"
+)
+
+WELCOME = (
+    "👋 歡迎使用「多益學習小助手」！\n"
+    "我能陪你背單字、學文法、考試，還會自動記錄你學過的字 📚\n\n"
+    "🔤 打這些字切換模式（會記住）：\n"
+    "• 教學 → 我教你單字並自動記錄\n"
+    "• 文法 → 教你多益文法\n"
+    "• 考試 → 用你記過的字考你、算分\n"
+    "• 聊天 → 一般英文家教，什麼都能問\n\n"
+    "⚡ 常用指令：\n"
+    "• /翻譯 句子　• /單字　• /今天　• /複習\n\n"
+    "💡 現在就打「教學」開始背第一個單字吧！\n"
+    "（隨時打「選單」可再看到說明）"
 )
 
 SWITCH = {
@@ -279,6 +294,8 @@ def route(text, user):
         return cmd_review(user)
     if s in ("/help", "/說明", "help", "?"):
         return HELP
+    if s in ("選單", "開始", "menu", "使用說明", "怎麼用"):
+        return WELCOME
 
     # 2) 模式切換（整句剛好是關鍵字才切換）
     for mode, kws in SWITCH.items():
@@ -326,6 +343,16 @@ def on_message(event):
         MessagingApi(api_client).reply_message(
             ReplyMessageRequest(reply_token=event.reply_token,
                                 messages=[TextMessage(text=reply)])
+        )
+
+
+@handler.add(FollowEvent)
+def on_follow(event):
+    """有人加 bot 好友時，自動送上使用說明。"""
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).reply_message(
+            ReplyMessageRequest(reply_token=event.reply_token,
+                                messages=[TextMessage(text=WELCOME)])
         )
 
 
