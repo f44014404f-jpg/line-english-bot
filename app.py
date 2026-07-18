@@ -344,12 +344,52 @@ def cmd_today(user):
     return f"📅 今天記了 {len(words)} 個：\n" + "\n".join(lines)
 
 
+def cmd_word():
+    """/單字：隨機一個多益單字，做成單字卡（不記錄，附收藏提示）。"""
+    sys = ("你是多益單字老師，隨機出一個多益中高頻單字。只輸出一行，用半形直線 | 分隔六欄，不要多餘文字：\n"
+           "英文單字|詞性(如 n./v./adj.)|中文意思|一句英文例句|該例句中文翻譯|一句超簡短記憶點(繁中)")
+    out = ask_gemini(sys, "出一個單字")
+    if out.startswith("⚠️"):
+        return out
+    parts = [p.strip() for p in out.strip().splitlines()[0].split("|")]
+    if len(parts) < 6:
+        return out
+    word, pos, meaning, ex_en, ex_zh, tip = parts[:6]
+    return word_card(word, pos, meaning, ex_en, ex_zh, tip,
+                     f"打「/記 {word} {meaning}」可收藏　·　「考試」測驗")
+
+
+def review_card(word, meaning, date):
+    bubble = {
+        "type": "bubble", "size": "kilo",
+        "header": {
+            "type": "box", "layout": "vertical", "backgroundColor": "#DB2777",
+            "paddingAll": "16px", "spacing": "xs",
+            "contents": [
+                {"type": "text", "text": "🧠 複習", "size": "sm", "color": "#FFFFFFDD"},
+                {"type": "text", "text": meaning, "size": "xxl", "weight": "bold",
+                 "color": "#FFFFFF", "wrap": True},
+            ],
+        },
+        "body": {
+            "type": "box", "layout": "vertical", "spacing": "sm", "paddingAll": "16px",
+            "contents": [
+                {"type": "text", "text": "答案", "size": "xs", "weight": "bold", "color": "#DB2777"},
+                {"type": "text", "text": word, "size": "xl", "weight": "bold",
+                 "color": "#222222", "wrap": True},
+                {"type": "text", "text": f"學於 {date}", "size": "xs", "color": "#AAAAAA"},
+            ],
+        },
+    }
+    return {"flex": bubble, "alt": f"複習：{meaning} = {word}"}
+
+
 def cmd_review(user):
     words = list_words(user)
     if not words:
         return "還沒有記錄的單字，先學幾個吧！"
     r = random.choice(words)
-    return f'🧠 複習：「{r["meaning"]}」的英文是？\n\n（答案：{r["word"]}）'
+    return review_card(r["word"], r["meaning"], r["date"])
 
 
 HELP = (
@@ -444,7 +484,7 @@ def route(text, user):
         b = s[3:].strip()
         return ask_gemini(GRAMMAR_ONE, b) if b else "用法：/文法 一句英文"
     if s.startswith("/單字"):
-        return ask_gemini(VOCAB_ONE, "出一題")
+        return cmd_word()
     if s.startswith("/記"):
         return cmd_record(user, s[2:].strip())
     if s.startswith("/今天"):
