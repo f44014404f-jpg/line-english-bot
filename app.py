@@ -35,6 +35,7 @@ from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi, ReplyMessageRequest, TextMessage,
+    FlexMessage, FlexContainer,
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent, FollowEvent
 
@@ -184,35 +185,74 @@ def handle_setup(user, text, pending):
         theme = st.get("theme", "多益高頻字")
         plan = {"theme": theme, "count": n, "date": tw_today(), "done": 0}
         set_state(user, "plan", json.dumps(plan))
-        first = teach_plan_word(user, plan)
-        return (f"📚 開始學【{theme}】，每天 {n} 個！\n"
-                f"學完打「繼續」接下一個；隔天也是打「繼續」，主題會一直記住不會亂跳。\n"
-                f"想換主題打「換主題」。\n\n{first}")
+        intro = (f"📚 開始學【{theme}】，每天 {n} 個！\n"
+                 "學完打「繼續」接下一個；隔天也是打「繼續」，主題會一直記住不會亂跳。\n"
+                 "想換主題打「換主題」。")
+        return [intro, teach_plan_word(user, plan)]
+
+
+def word_card(word, pos, meaning, ex_en, ex_zh, tip, footer, accent="#0D9488"):
+    """組一張 LINE Flex 單字卡。"""
+    bubble = {
+        "type": "bubble", "size": "mega",
+        "header": {
+            "type": "box", "layout": "vertical", "backgroundColor": accent,
+            "paddingAll": "18px", "spacing": "xs",
+            "contents": [
+                {"type": "text", "text": word, "size": "3xl", "weight": "bold",
+                 "color": "#FFFFFF", "wrap": True},
+                {"type": "text", "text": f"{pos}　{meaning}", "size": "md",
+                 "color": "#FFFFFFEE", "wrap": True},
+            ],
+        },
+        "body": {
+            "type": "box", "layout": "vertical", "spacing": "sm", "paddingAll": "18px",
+            "contents": [
+                {"type": "text", "text": "例句", "size": "xs", "weight": "bold", "color": accent},
+                {"type": "text", "text": ex_en, "size": "md", "wrap": True, "color": "#222222"},
+                {"type": "text", "text": ex_zh, "size": "sm", "wrap": True, "color": "#999999"},
+                {"type": "separator", "margin": "lg"},
+                {"type": "box", "layout": "baseline", "margin": "lg", "spacing": "sm",
+                 "contents": [
+                     {"type": "text", "text": "💡", "flex": 0, "size": "sm"},
+                     {"type": "text", "text": tip, "size": "sm", "wrap": True, "color": "#555555"},
+                 ]},
+            ],
+        },
+        "footer": {
+            "type": "box", "layout": "vertical", "paddingAll": "12px",
+            "contents": [
+                {"type": "text", "text": footer, "size": "xs", "color": "#AAAAAA",
+                 "align": "center", "wrap": True},
+            ],
+        },
+    }
+    return {"flex": bubble, "alt": f"單字卡：{word}（{meaning}）"}
 
 
 def teach_plan_word(user, plan):
-    """依主題教下一個沒學過的單字、自動記錄、更新今日進度。"""
+    """依主題教下一個沒學過的單字，回傳 Flex 單字卡；自動記錄並更新進度。"""
     known = [r["word"] for r in list_words(user)][-100:]
     avoid = "、".join(known) if known else "（無）"
     theme = plan["theme"]
     sys = (
-        f"你是多益單字老師，正在帶學生用「{theme}」這個主題循序漸進學單字，"
-        "由常用到少用、由易到難，一次教一個。"
-        f"避開這些已經學過的字：{avoid}。\n"
-        "嚴格照格式輸出，第一行給程式讀，其餘給人看（把角括號換成實際內容）：\n"
-        "DATA: <英文單字>|<中文意思>\n"
-        "📖 <英文單字> (詞性) <中文意思>\n例句：一句英文（附中譯）\n一句超簡短用法或記憶點。最多 5 行。"
+        f"你是多益單字老師，用「{theme}」這個主題循序漸進教單字，由常用到少用、由易到難，一次一個。"
+        f"避開這些學過的字：{avoid}。\n"
+        "只輸出一行，用半形直線 | 分隔六個欄位，不要多餘文字：\n"
+        "英文單字|詞性(如 n./v./adj.)|中文意思|一句英文例句|該例句中文翻譯|一句超簡短記憶點或用法(繁中)"
     )
     out = ask_gemini(sys, f"主題：{theme}，教下一個單字")
-    if out.startswith("⚠️"):   # Gemini 暫時失敗：不計進度，讓使用者再試
+    if out.startswith("⚠️"):
         return "⚠️ 剛剛系統有點忙，沒抓到單字，請再打一次「繼續」🙏"
-    m = re.search(r"DATA:\s*(.+?)\|(.+)", out)
-    shown = re.sub(r"^DATA:.*\n?", "", out, count=1).strip()
-    if m:
-        record_word(user, m.group(1).strip(), m.group(2).strip())
+    parts = [p.strip() for p in out.strip().splitlines()[0].split("|")]
+    if len(parts) < 6:
+        return f"{out}\n\n（今天第 {plan.get('done', 0) + 1}/{plan['count']} 個）打「繼續」"
+    word, pos, meaning, ex_en, ex_zh, tip = parts[:6]
+    record_word(user, word, meaning)
     plan["done"] = plan.get("done", 0) + 1
     set_state(user, "plan", json.dumps(plan))
-    return f"{shown}\n\n（今天第 {plan['done']}/{plan['count']} 個）學完打「繼續」"
+    footer = f"今天第 {plan['done']}/{plan['count']} 個  · 打「繼續」學下一個"
+    return word_card(word, pos, meaning, ex_en, ex_zh, tip, footer)
 
 
 def plan_continue(user, plan, force=False):
@@ -381,6 +421,7 @@ MANUAL = (
 
 SWITCH = {
     "grammar": {"文法", "文法模式", "學文法"},
+    "translate": {"翻譯", "翻譯模式"},
     "exam": {"考試", "測驗", "考我"},
     "chat": {"聊天", "一般", "回家教", "家教"},
 }
@@ -427,8 +468,9 @@ def route(text, user):
             if mode == "exam":
                 return start_exam(user)
             set_state(user, mode, "")
-            names = {"grammar": "文法教學", "chat": "一般家教"}
+            names = {"grammar": "文法教學", "translate": "翻譯", "chat": "一般家教"}
             tip = {"grammar": "貼一句英文我幫你看文法，或打「下一個」教你新重點。",
+                   "translate": "直接打中文或英文，我就幫你翻譯並點重點。",
                    "chat": "有什麼英文問題都可以問我。"}[mode]
             return f"已切換到「{names[mode]}」模式 ✅\n{tip}\n（打「教學」「考試」等可再切換）"
 
@@ -457,6 +499,8 @@ def route(text, user):
 
     if mode == "grammar":
         return grammar_teach(s)
+    if mode == "translate":
+        return ask_gemini(TRANSLATE, s)
     return ask_gemini(TUTOR, s)  # chat
 
 
@@ -472,6 +516,19 @@ def callback():
     return "OK"
 
 
+def to_messages(result):
+    """route() 可能回傳文字、Flex 卡片(dict)、或它們的列表 → 轉成 LINE 訊息物件。"""
+    items = result if isinstance(result, list) else [result]
+    msgs = []
+    for it in items:
+        if isinstance(it, dict) and it.get("flex"):
+            msgs.append(FlexMessage(alt_text=it.get("alt", "單字卡"),
+                                    contents=FlexContainer.from_dict(it["flex"])))
+        else:
+            msgs.append(TextMessage(text=str(it)))
+    return msgs[:5]  # LINE 一次最多 5 則
+
+
 @handler.add(MessageEvent, message=TextMessageContent)
 def on_message(event):
     user_id = getattr(event.source, "user_id", "unknown")
@@ -479,7 +536,7 @@ def on_message(event):
     with ApiClient(configuration) as api_client:
         MessagingApi(api_client).reply_message(
             ReplyMessageRequest(reply_token=event.reply_token,
-                                messages=[TextMessage(text=reply)])
+                                messages=to_messages(reply))
         )
 
 
