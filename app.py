@@ -21,6 +21,7 @@ import time
 import json
 import random
 import datetime
+from urllib.parse import quote
 
 import requests
 from flask import Flask, request, abort
@@ -191,6 +192,11 @@ def handle_setup(user, text, pending):
         return [intro, teach_plan_word(user, plan)]
 
 
+def tts_url(word):
+    """Google 免費 TTS，任何英文字都能發音（合成 mp3）。"""
+    return f"https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=en&q={quote(word)}"
+
+
 def word_card(word, pos, meaning, ex_en, ex_zh, tip, footer, accent="#0D9488"):
     """組一張 LINE Flex 單字卡。"""
     bubble = {
@@ -220,8 +226,10 @@ def word_card(word, pos, meaning, ex_en, ex_zh, tip, footer, accent="#0D9488"):
             ],
         },
         "footer": {
-            "type": "box", "layout": "vertical", "paddingAll": "12px",
+            "type": "box", "layout": "vertical", "paddingAll": "12px", "spacing": "sm",
             "contents": [
+                {"type": "button", "style": "primary", "color": accent, "height": "sm",
+                 "action": {"type": "uri", "label": "🔊 發音", "uri": tts_url(word)}},
                 {"type": "text", "text": footer, "size": "xs", "color": "#AAAAAA",
                  "align": "center", "wrap": True},
             ],
@@ -378,6 +386,8 @@ def review_card(word, meaning, date):
                 {"type": "text", "text": word, "size": "xl", "weight": "bold",
                  "color": "#222222", "wrap": True},
                 {"type": "text", "text": f"學於 {date}", "size": "xs", "color": "#AAAAAA"},
+                {"type": "button", "style": "primary", "color": "#DB2777", "height": "sm", "margin": "md",
+                 "action": {"type": "uri", "label": "🔊 發音", "uri": tts_url(word)}},
             ],
         },
     }
