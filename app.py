@@ -394,12 +394,98 @@ def review_card(word, meaning, date):
     return {"flex": bubble, "alt": f"複習：{meaning} = {word}"}
 
 
-def cmd_review(user):
-    words = list_words(user)
+# ---------- SRS 間隔複習 ----------
+# 每答對一次，下次複習間隔拉長（天）；答錯則縮回、隔天再考
+SRS_DAYS = [1, 2, 4, 7, 15, 30, 60, 120]
+
+
+def srs_key(uid):
+    return f"{uid}::srs"
+
+
+def get_srs(uid):
+    _, pending = get_state(srs_key(uid))
+    return parse_json(pending)
+
+
+def save_srs(uid, data):
+    set_state(srs_key(uid), "srs", json.dumps(data, ensure_ascii=False))
+
+
+def compute_due(words, srs, today):
+    """回傳到期(或從未複習)的單字，去重。"""
+    due, seen = [], set()
+    for r in words:
+        w = r["word"]
+        if w in seen:
+            continue
+        seen.add(w)
+        s = srs.get(w)
+        if s is None or s.get("next", "") <= today:
+            due.append(r)
+    return due
+
+
+def apply_grade(srs, word, correct, today):
+    s = srs.get(word, {"lv": 0, "seen": 0, "miss": 0})
+    s["seen"] = s.get("seen", 0) + 1
+    if correct:
+        s["lv"] = min(s.get("lv", 0) + 1, len(SRS_DAYS) - 1)
+    else:
+        s["miss"] = s.get("miss", 0) + 1
+        s["lv"] = max(0, s.get("lv", 0) - 1)
+    days = SRS_DAYS[s["lv"]] if correct else 1
+    s["next"] = (datetime.date.fromisoformat(today) + datetime.timedelta(days=days)).isoformat()
+    srs[word] = s
+    return srs
+
+
+def start_review(uid):
+    words = list_words(uid)
     if not words:
-        return "還沒有記錄的單字，先學幾個吧！"
-    r = random.choice(words)
-    return review_card(r["word"], r["meaning"], r["date"])
+        return "還沒有記錄的單字，先打「教學」學幾個吧 📖"
+    srs = get_srs(uid)
+    due = compute_due(words, srs, tw_today())
+    if not due:
+        return "🎉 目前沒有到期要複習的字，記得很棒！\n想加強可打「考試」隨機測，或「教學」學新的。"
+    r = due[0]
+    set_state(uid, "review", json.dumps({"answer": r["word"], "meaning": r["meaning"], "n": 0, "ok": 0}))
+    return (f"🔁 智慧複習開始！有 {len(due)} 個到期的字。答錯沒關係，打「結束」可停。\n\n"
+            f"Q1：「{r['meaning']}」的英文是？")
+
+
+def review_answer(uid, text, pending):
+    try:
+        st = json.loads(pending)
+    except Exception:
+        return start_review(uid)
+    today = tw_today()
+    correct = text.strip().lower() == st["answer"].strip().lower()
+    srs = apply_grade(get_srs(uid), st["answer"], correct, today)
+    save_srs(uid, srs)
+    n = st.get("n", 0) + 1
+    ok = st.get("ok", 0) + (1 if correct else 0)
+    fb = f"✅ 答對！{st['answer']}" if correct else f"❌ 答案是 {st['answer']}（{st['meaning']}）"
+
+    due = [r for r in compute_due(list_words(uid), srs, today) if r["word"] != st["answer"]]
+    if not due:
+        set_state(uid, "chat", "")
+        return f"{fb}\n\n🏁 複習完成！這輪答對 {ok}/{n}，到期的字都複習完了 👏"
+    r = due[0]
+    set_state(uid, "review", json.dumps({"answer": r["word"], "meaning": r["meaning"], "n": n, "ok": ok}))
+    return f"{fb}　(答對 {ok}/{n})\n\nQ{n + 1}：「{r['meaning']}」的英文是？"
+
+
+def end_review(uid, pending):
+    try:
+        st = json.loads(pending)
+        n, ok = st.get("n", 0), st.get("ok", 0)
+    except Exception:
+        n, ok = 0, 0
+    set_state(uid, "chat", "")
+    if n == 0:
+        return "複習結束，回到一般模式 🙂"
+    return f"🏁 複習結束！這輪答對 {ok}/{n}。到期的字之後會再排給你複習。"
 
 
 HELP = (
@@ -461,7 +547,7 @@ MANUAL = (
     "• /單字 → 隨機一個多益單字\n"
     "• /記 apple 蘋果 → 手動記一個字\n"
     "• /今天 → 看今天學了哪些\n"
-    "• /複習 → 隨機抽考學過的字\n\n"
+    "• /複習 → 智慧複習：優先考到期、常錯的字；答對拉長間隔、答錯隔天再考\n\n"
 
     "【小提醒】\n"
     "• 每個人資料分開，朋友加同一個 bot 也不會混在一起\n"
@@ -499,8 +585,8 @@ def route(text, user):
         return cmd_record(user, s[2:].strip())
     if s.startswith("/今天"):
         return cmd_today(user)
-    if s.startswith("/複習"):
-        return cmd_review(user)
+    if s.startswith("/複習") or s in ("複習", "智慧複習"):
+        return start_review(user)
     if s in ("/help", "/說明", "help", "?"):
         return HELP
     if s in ("選單", "開始", "menu", "使用說明", "怎麼用"):
@@ -534,6 +620,11 @@ def route(text, user):
         if s in ("結束", "停", "stop", "退出"):
             return end_exam(user, pending)
         return exam_answer(user, s, pending)
+
+    if mode == "review":
+        if s in ("結束", "停", "stop", "退出"):
+            return end_review(user, pending)
+        return review_answer(user, s, pending)
 
     if mode == "plan":
         plan = parse_json(pending)
