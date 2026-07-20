@@ -1,27 +1,30 @@
 """
-LINE 英文小助手
-- LINE Messaging API (Reply 模式，免費)
-- Google Gemini (gemini-2.5-flash)
-- Google 試算表 (透過 Apps Script Web App 存單字與狀態)
+LINE 股票學習導師
+────────────────────────────────────────────────────────
+定位：投資「教育 + 研究紀錄」，不是報明牌、不給買賣建議。
+流程：看書想法 → LINE 隨手記 → AI 幫你分類/追問/轉成可驗證假設
+      → 存 Google 試算表 → 週日匯出 → 丟 GPT/Codex 用驗證引擎回測。
 
-模式 (打這些字切換，會被記住)：
-    教學 / 背單字     → 單字教學模式 (教你單字並自動記錄，避開學過的)
-    文法             → 文法教學模式
-    考試             → 考試模式 (用你記過的單字考你、計分)
-    聊天 / 結束       → 一般家教模式
+- LINE Messaging API（Reply 模式，永久免費）
+- Google Gemini（gemini-2.5-flash-lite，免費額度大）
+- Google 試算表（透過 Apps Script Web App 存 lessons / hypotheses / state）
 
-指令 (任何模式都能用)：
-    /翻譯 <句子>   /文法 <句子>   /單字
-    /記 <單字> [中文]   /今天   /複習   /help
+模式（打這些字切換，會被記住）：
+    導師 / 聊天   → 一般股票教育問答（預設）
+    學一課        → 每次教一個投資觀念 + 出 2 題確認理解
+
+指令（任何模式都能用）：
+    想法：<你的想法>     → 分類 A/B/C/D，可回測就轉成假設 JSON 存起來
+    筆記：<讀書心得>     → 整理成學習筆記存起來
+    整理本週             → 產生 weekly_review，附給 GPT/Codex 的複核 prompt
+    /help  /選單  /操作手冊
 """
 
 import os
 import re
-import time
 import json
-import random
+import time
 import datetime
-from urllib.parse import quote
 
 import requests
 from flask import Flask, request, abort
@@ -55,14 +58,29 @@ app = Flask(__name__)
 configuration = Configuration(access_token=LINE_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
 gemini = genai.Client(api_key=GEMINI_KEY)
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")  # lite 免費每日額度大很多
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
 
 TW = datetime.timezone(datetime.timedelta(hours=8))
 tw_today = lambda: datetime.datetime.now(TW).date().isoformat()
-tw_time = lambda: datetime.datetime.now(TW).strftime("%H:%M")
+tw_now = lambda: datetime.datetime.now(TW).strftime("%Y-%m-%d %H:%M")
+
+DISCLAIMER = "＊這是投資教育與研究紀錄，不是買賣建議；任何策略都要回測與風控。"
+
+# 驗證引擎實際有的資料欄位 —— 給 AI 產生假設時只能用這些，確保 Codex 回測得動
+DATA_FIELDS = """
+可用資料欄位（驗證引擎 cache_*.json / causal.db 實際有的，只能用這些）：
+[價量 日K 2015起] close, open, high, low, volume, ma5, ma20, ma60, ma120, ma240,
+                  high_Nd(N日新高), return_Nd(N日報酬), vol_ma20, 量比
+[月營收 2019起]   revenue_yoy(%), revenue_mom(%), revenue_yoy_positive_months(連續正成長月數)
+[三大法人 2015起] foreign_net(外資淨買賣超張), trust_net(投信淨), foreign_buy_days(連買天數)
+[融資融券]        margin(融資餘額), margin_chg(增減), short(融券)
+[集保大戶 週]     over400_pct(400張大戶%), over1000_pct(千張大戶%), over400_chg_1w(週變化)
+[因果庫]          theme(產業題材), event(事件), supply_chain_role(供應鏈角色),
+                  revenue_sensitivity(營收敏感度)
+""".strip()
 
 
-# ---------- 試算表 (呼叫 Apps Script) ----------
+# ---------- 試算表（呼叫 Apps Script）----------
 def sheet_call(payload: dict, retries: int = 2):
     if not SHEET_URL or not SHEET_TOKEN:
         return None
@@ -73,33 +91,6 @@ def sheet_call(payload: dict, retries: int = 2):
         except Exception as e:
             print(f"sheet_call error (try {attempt + 1}):", e)
     return None
-
-
-def norm_date(v) -> str:
-    """試算表可能把日期回成 ISO 時間字串，統一轉回台灣的 YYYY-MM-DD。"""
-    s = str(v)
-    if "T" in s:
-        try:
-            dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(TW)
-            return dt.date().isoformat()
-        except Exception:
-            return s[:10]
-    return s[:10]
-
-
-def record_word(user, word, meaning):
-    return sheet_call({"action": "record", "user": user, "word": word,
-                       "meaning": meaning, "date": tw_today(), "time": tw_time()})
-
-
-def list_words(user):
-    res = sheet_call({"action": "list", "user": user})
-    if not res or not res.get("ok"):
-        return []
-    rows = res.get("rows", [])
-    for r in rows:
-        r["date"] = norm_date(r.get("date", ""))
-    return rows
 
 
 def get_state(user):
@@ -113,20 +104,45 @@ def set_state(user, mode, pending=""):
     sheet_call({"action": "setstate", "user": user, "mode": mode, "pending": pending})
 
 
+def add_lesson(user, row: dict):
+    row.update({"action": "add_lesson", "user": user})
+    return sheet_call(row)
+
+
+def add_hypothesis(user, row: dict):
+    row.update({"action": "add_hypothesis", "user": user})
+    return sheet_call(row)
+
+
+def list_since(user, kind, since):
+    """kind = 'lessons' | 'hypotheses'；回傳本週（含）以後的紀錄。"""
+    res = sheet_call({"action": f"list_{kind}", "user": user, "since": since})
+    if not res or not res.get("ok"):
+        return []
+    return res.get("rows", [])
+
+
+def count_hypotheses(user):
+    res = sheet_call({"action": "count_hypotheses", "user": user})
+    return (res or {}).get("count", 0)
+
+
 # ---------- Gemini ----------
-def ask_gemini(system_prompt: str, user_text: str, temp=0.7) -> str:
+def ask_gemini(system_prompt: str, user_text: str, temp=0.6) -> str:
     last = ""
     for attempt in range(3):
         try:
             resp = gemini.models.generate_content(
                 model=MODEL, contents=user_text,
-                config=types.GenerateContentConfig(system_instruction=system_prompt, temperature=temp),
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt, temperature=temp),
             )
             return (resp.text or "").strip() or "（沒有回傳內容，再試一次）"
         except Exception as e:
             last = str(e)
             transient = any(k in last for k in
-                            ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "overloaded", "high demand"))
+                            ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED",
+                             "overloaded", "high demand"))
             if transient and attempt < 2:
                 time.sleep(1.5)
                 continue
@@ -134,515 +150,291 @@ def ask_gemini(system_prompt: str, user_text: str, temp=0.7) -> str:
     return f"⚠️ 呼叫 Gemini 失敗：{last}"
 
 
-SHORT = "回答精簡、適合手機閱讀，最多 6 行，不要長篇大論。"
-
-TUTOR = f"你是親切的多益英文家教，對象是台灣中級學習者。用繁體中文說明，英文保留英文。{SHORT}"
-TRANSLATE = f"你是翻譯老師。中文就翻成自然英文、英文就翻成中文，翻完用中文點 1 個重點。{SHORT}"
-GRAMMAR_ONE = f"你是多益文法老師，針對使用者的句子挑一個最常考的文法點簡短講解，有錯就指出正確寫法。{SHORT}"
-VOCAB_ONE = ("你是多益單字老師，出一個多益中高頻單字。格式：\n📖 word (詞性) 中文\n例句：英文（中譯）\n"
-             "🧠 克漏字一句，挖空該字，最後附『（答案：word）』。精簡。")
-MEANING = "你是英漢字典，只回覆這個英文單字最常用的繁體中文意思，最多10字，不要例句詞性。"
-
-
-def parse_json(s):
+def extract_json(s: str):
+    """從 AI 回覆裡挖出第一個 JSON 物件。"""
+    if not s:
+        return None
+    m = re.search(r"\{.*\}", s, re.S)
+    if not m:
+        return None
     try:
-        return json.loads(s) if s else {}
+        return json.loads(m.group())
     except Exception:
-        return {}
+        return None
 
 
-def extract_int(s):
-    m = re.search(r"\d+", s)
-    return int(m.group()) if m else None
+SHORT = "回答精簡、適合手機閱讀，最多 8 行，不要長篇大論。"
 
-
-# ---------- 模式：學習計畫（教學）----------
-def enter_plan(user):
-    """打『教學』：有計畫就接著教下一個，沒計畫就開始問主題。"""
-    mode, pending = get_state(user)
-    if mode == "plan":
-        plan = parse_json(pending)
-        if plan.get("theme"):
-            return plan_continue(user, plan)
-    set_state(user, "setup", json.dumps({"step": "theme"}))
-    return ("📚 我們來排個學習計畫！\n"
-            "你想學什麼主題或方向？例如：\n"
-            "• 出國旅遊　• 商業 email　• 面試英文\n"
-            "• 字首 pre-　• 多益高頻字\n\n"
-            "直接打你想學的主題 👇")
-
-
-def handle_setup(user, text, pending):
-    st = parse_json(pending)
-    if st.get("step") == "theme":
-        theme = text.strip()
-        set_state(user, "setup", json.dumps({"step": "count", "theme": theme}))
-        return f"好！主題就設定為【{theme}】。\n一天想學幾個單字呢？打數字就好（例如 5）👇"
-    if st.get("step") == "count":
-        n = extract_int(text)
-        if not n:
-            return "請打一個數字，例如 5 🙂"
-        n = max(1, min(n, 20))
-        theme = st.get("theme", "多益高頻字")
-        plan = {"theme": theme, "count": n, "date": tw_today(), "done": 0}
-        set_state(user, "plan", json.dumps(plan))
-        intro = (f"📚 開始學【{theme}】，每天 {n} 個！\n"
-                 "學完打「繼續」接下一個；隔天也是打「繼續」，主題會一直記住不會亂跳。\n"
-                 "想換主題打「換主題」。")
-        return [intro, teach_plan_word(user, plan)]
-
-
-def tts_url(word):
-    """Google 免費 TTS，任何英文字都能發音（合成 mp3）。"""
-    return f"https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=en&q={quote(word)}"
-
-
-def word_card(word, pos, meaning, ex_en, ex_zh, tip, footer, accent="#0D9488"):
-    """組一張 LINE Flex 單字卡。"""
-    bubble = {
-        "type": "bubble", "size": "mega",
-        "header": {
-            "type": "box", "layout": "vertical", "backgroundColor": accent,
-            "paddingAll": "18px", "spacing": "xs",
-            "contents": [
-                {"type": "text", "text": word, "size": "3xl", "weight": "bold",
-                 "color": "#FFFFFF", "wrap": True},
-                {"type": "text", "text": f"{pos}　{meaning}", "size": "md",
-                 "color": "#FFFFFFEE", "wrap": True},
-            ],
-        },
-        "body": {
-            "type": "box", "layout": "vertical", "spacing": "sm", "paddingAll": "18px",
-            "contents": [
-                {"type": "text", "text": "例句", "size": "xs", "weight": "bold", "color": accent},
-                {"type": "text", "text": ex_en, "size": "md", "wrap": True, "color": "#222222"},
-                {"type": "text", "text": ex_zh, "size": "sm", "wrap": True, "color": "#999999"},
-                {"type": "separator", "margin": "lg"},
-                {"type": "box", "layout": "baseline", "margin": "lg", "spacing": "sm",
-                 "contents": [
-                     {"type": "text", "text": "💡", "flex": 0, "size": "sm"},
-                     {"type": "text", "text": tip, "size": "sm", "wrap": True, "color": "#555555"},
-                 ]},
-            ],
-        },
-        "footer": {
-            "type": "box", "layout": "vertical", "paddingAll": "12px", "spacing": "sm",
-            "contents": [
-                {"type": "button", "style": "primary", "color": accent, "height": "sm",
-                 "action": {"type": "uri", "label": "🔊 發音", "uri": tts_url(word)}},
-                {"type": "text", "text": footer, "size": "xs", "color": "#AAAAAA",
-                 "align": "center", "wrap": True},
-            ],
-        },
-    }
-    return {"flex": bubble, "alt": f"單字卡：{word}（{meaning}）"}
-
-
-def teach_plan_word(user, plan):
-    """依主題教下一個沒學過的單字，回傳 Flex 單字卡；自動記錄並更新進度。"""
-    known = [r["word"] for r in list_words(user)][-100:]
-    avoid = "、".join(known) if known else "（無）"
-    theme = plan["theme"]
-    sys = (
-        f"你是多益單字老師，用「{theme}」這個主題循序漸進教單字，由常用到少用、由易到難，一次一個。"
-        f"避開這些學過的字：{avoid}。\n"
-        "只輸出一行，用半形直線 | 分隔六個欄位，不要多餘文字：\n"
-        "英文單字|詞性(如 n./v./adj.)|中文意思|一句英文例句|該例句中文翻譯|一句超簡短記憶點或用法(繁中)"
-    )
-    out = ask_gemini(sys, f"主題：{theme}，教下一個單字")
-    if out.startswith("⚠️"):
-        return "⚠️ 剛剛系統有點忙，沒抓到單字，請再打一次「繼續」🙏"
-    parts = [p.strip() for p in out.strip().splitlines()[0].split("|")]
-    if len(parts) < 6:
-        return f"{out}\n\n（今天第 {plan.get('done', 0) + 1}/{plan['count']} 個）打「繼續」"
-    word, pos, meaning, ex_en, ex_zh, tip = parts[:6]
-    record_word(user, word, meaning)
-    plan["done"] = plan.get("done", 0) + 1
-    set_state(user, "plan", json.dumps(plan))
-    footer = f"今天第 {plan['done']}/{plan['count']} 個  · 打「繼續」學下一個"
-    return word_card(word, pos, meaning, ex_en, ex_zh, tip, footer)
-
-
-def plan_continue(user, plan, force=False):
-    if plan.get("date") != tw_today():   # 新的一天：主題不變，只把今日進度歸零
-        plan["date"] = tw_today()
-        plan["done"] = 0
-        set_state(user, "plan", json.dumps(plan))
-    if plan.get("done", 0) >= plan["count"] and not force:
-        return (f"🎉 今天【{plan['theme']}】的 {plan['count']} 個單字學完了！\n"
-                f"明天打「繼續」接著學；想現在多學就打「更多」。\n"
-                f"（打「考試」可以測驗今天學的字）")
-    return teach_plan_word(user, plan)
-
-
-def grammar_teach(user_text):
-    sys = ("你是多益文法老師。使用者給句子就講解該句最常考的一個文法點並修正錯誤；"
-           f"若只是說「下一個」或沒給句子，就教一個多益常考文法重點並給例句。{SHORT}")
-    return ask_gemini(sys, user_text or "教我一個文法重點")
-
-
-# ---------- 模式：考試 ----------
-def next_question(user, score, n):
-    words = list_words(user)
-    r = random.choice(words)
-    pending = json.dumps({"answer": r["word"], "meaning": r["meaning"], "score": score, "n": n})
-    return pending, f'Q{n + 1}：「{r["meaning"]}」的英文是？'
-
-
-def start_exam(user):
-    if not list_words(user):
-        set_state(user, "chat", "")
-        return "考試需要先有記錄的單字。先打「教學」學幾個，或用 /記 新增，再來考試 📖"
-    pending, q = next_question(user, 0, 0)
-    set_state(user, "exam", pending)
-    return "📝 考試開始！答錯沒關係，打「結束」可以停。\n\n" + q
-
-
-def exam_answer(user, text, pending):
-    try:
-        st = json.loads(pending)
-    except Exception:
-        return start_exam(user)
-    ans, meaning = st["answer"], st["meaning"]
-    score, n = st["score"], st["n"]
-    n += 1
-    if text.strip().lower() == ans.strip().lower():
-        score += 1
-        fb = f"✅ 答對！{ans}（{meaning}）"
-    else:
-        fb = f"❌ 答案是 {ans}（{meaning}）"
-    pending, q = next_question(user, score, n)
-    set_state(user, "exam", pending)
-    return f"{fb}\n目前 {score}/{n} 分\n\n{q}"
-
-
-def end_exam(user, pending):
-    try:
-        st = json.loads(pending)
-        score, n = st["score"], st["n"]
-    except Exception:
-        score, n = 0, 0
-    set_state(user, "chat", "")
-    if n == 0:
-        return "考試結束，回到一般模式 🙂"
-    return f"🏁 考試結束！你答對 {score}/{n} 題。回到一般模式，隨時打「考試」再來一輪。"
-
-
-# ---------- 記錄類指令 ----------
-def cmd_record(user, body):
-    if not SHEET_URL:
-        return "⚠️ 還沒設定好試算表。"
-    if not body:
-        return "用法：/記 單字 中文（中文可省略，我會自動查）\n例如：/記 procrastinate 拖延"
-    parts = body.split(maxsplit=1)
-    word = parts[0]
-    meaning = parts[1].strip() if len(parts) > 1 else ask_gemini(MEANING, word)
-    res = record_word(user, word, meaning)
-    if not res or not res.get("ok"):
-        return "⚠️ 寫入試算表失敗，稍後再試。"
-    today_n = sum(1 for r in list_words(user) if r["date"] == tw_today())
-    return f"✅ 已記錄！{word}（{meaning}）\n今天第 {today_n} 個單字 💪"
-
-
-def cmd_today(user):
-    words = [r for r in list_words(user) if r["date"] == tw_today()]
-    if not words:
-        return "今天還沒記單字，打「教學」或用 /記 開始吧 📖"
-    lines = [f'{i}. {r["word"]}（{r["meaning"]}）' for i, r in enumerate(words, 1)]
-    return f"📅 今天記了 {len(words)} 個：\n" + "\n".join(lines)
-
-
-def cmd_word():
-    """/單字：隨機一個多益單字，做成單字卡（不記錄，附收藏提示）。"""
-    sys = ("你是多益單字老師，隨機出一個多益中高頻單字。只輸出一行，用半形直線 | 分隔六欄，不要多餘文字：\n"
-           "英文單字|詞性(如 n./v./adj.)|中文意思|一句英文例句|該例句中文翻譯|一句超簡短記憶點(繁中)")
-    out = ask_gemini(sys, "出一個單字")
-    if out.startswith("⚠️"):
-        return out
-    parts = [p.strip() for p in out.strip().splitlines()[0].split("|")]
-    if len(parts) < 6:
-        return out
-    word, pos, meaning, ex_en, ex_zh, tip = parts[:6]
-    return word_card(word, pos, meaning, ex_en, ex_zh, tip,
-                     f"打「/記 {word} {meaning}」可收藏　·　「考試」測驗")
-
-
-def review_card(word, meaning, date):
-    bubble = {
-        "type": "bubble", "size": "kilo",
-        "header": {
-            "type": "box", "layout": "vertical", "backgroundColor": "#DB2777",
-            "paddingAll": "16px", "spacing": "xs",
-            "contents": [
-                {"type": "text", "text": "🧠 複習", "size": "sm", "color": "#FFFFFFDD"},
-                {"type": "text", "text": meaning, "size": "xxl", "weight": "bold",
-                 "color": "#FFFFFF", "wrap": True},
-            ],
-        },
-        "body": {
-            "type": "box", "layout": "vertical", "spacing": "sm", "paddingAll": "16px",
-            "contents": [
-                {"type": "text", "text": "答案", "size": "xs", "weight": "bold", "color": "#DB2777"},
-                {"type": "text", "text": word, "size": "xl", "weight": "bold",
-                 "color": "#222222", "wrap": True},
-                {"type": "text", "text": f"學於 {date}", "size": "xs", "color": "#AAAAAA"},
-                {"type": "button", "style": "primary", "color": "#DB2777", "height": "sm", "margin": "md",
-                 "action": {"type": "uri", "label": "🔊 發音", "uri": tts_url(word)}},
-            ],
-        },
-    }
-    return {"flex": bubble, "alt": f"複習：{meaning} = {word}"}
-
-
-# ---------- SRS 間隔複習 ----------
-# 每答對一次，下次複習間隔拉長（天）；答錯則縮回、隔天再考
-SRS_DAYS = [1, 2, 4, 7, 15, 30, 60, 120]
-
-
-def srs_key(uid):
-    return f"{uid}::srs"
-
-
-def get_srs(uid):
-    _, pending = get_state(srs_key(uid))
-    return parse_json(pending)
-
-
-def save_srs(uid, data):
-    set_state(srs_key(uid), "srs", json.dumps(data, ensure_ascii=False))
-
-
-def compute_due(words, srs, today):
-    """回傳到期(或從未複習)的單字，去重。"""
-    due, seen = [], set()
-    for r in words:
-        w = r["word"]
-        if w in seen:
-            continue
-        seen.add(w)
-        s = srs.get(w)
-        if s is None or s.get("next", "") <= today:
-            due.append(r)
-    return due
-
-
-def apply_grade(srs, word, correct, today):
-    s = srs.get(word, {"lv": 0, "seen": 0, "miss": 0})
-    s["seen"] = s.get("seen", 0) + 1
-    if correct:
-        s["lv"] = min(s.get("lv", 0) + 1, len(SRS_DAYS) - 1)
-    else:
-        s["miss"] = s.get("miss", 0) + 1
-        s["lv"] = max(0, s.get("lv", 0) - 1)
-    days = SRS_DAYS[s["lv"]] if correct else 1
-    s["next"] = (datetime.date.fromisoformat(today) + datetime.timedelta(days=days)).isoformat()
-    srs[word] = s
-    return srs
-
-
-def start_review(uid):
-    words = list_words(uid)
-    if not words:
-        return "還沒有記錄的單字，先打「教學」學幾個吧 📖"
-    srs = get_srs(uid)
-    due = compute_due(words, srs, tw_today())
-    if not due:
-        return "🎉 目前沒有到期要複習的字，記得很棒！\n想加強可打「考試」隨機測，或「教學」學新的。"
-    r = due[0]
-    set_state(uid, "review", json.dumps({"answer": r["word"], "meaning": r["meaning"], "n": 0, "ok": 0}))
-    return (f"🔁 智慧複習開始！有 {len(due)} 個到期的字。答錯沒關係，打「結束」可停。\n\n"
-            f"Q1：「{r['meaning']}」的英文是？")
-
-
-def review_answer(uid, text, pending):
-    try:
-        st = json.loads(pending)
-    except Exception:
-        return start_review(uid)
-    today = tw_today()
-    correct = text.strip().lower() == st["answer"].strip().lower()
-    srs = apply_grade(get_srs(uid), st["answer"], correct, today)
-    save_srs(uid, srs)
-    n = st.get("n", 0) + 1
-    ok = st.get("ok", 0) + (1 if correct else 0)
-    fb = f"✅ 答對！{st['answer']}" if correct else f"❌ 答案是 {st['answer']}（{st['meaning']}）"
-
-    due = [r for r in compute_due(list_words(uid), srs, today) if r["word"] != st["answer"]]
-    if not due:
-        set_state(uid, "chat", "")
-        return f"{fb}\n\n🏁 複習完成！這輪答對 {ok}/{n}，到期的字都複習完了 👏"
-    r = due[0]
-    set_state(uid, "review", json.dumps({"answer": r["word"], "meaning": r["meaning"], "n": n, "ok": ok}))
-    return f"{fb}　(答對 {ok}/{n})\n\nQ{n + 1}：「{r['meaning']}」的英文是？"
-
-
-def end_review(uid, pending):
-    try:
-        st = json.loads(pending)
-        n, ok = st.get("n", 0), st.get("ok", 0)
-    except Exception:
-        n, ok = 0, 0
-    set_state(uid, "chat", "")
-    if n == 0:
-        return "複習結束，回到一般模式 🙂"
-    return f"🏁 複習結束！這輪答對 {ok}/{n}。到期的字之後會再排給你複習。"
-
-
-HELP = (
-    "🔤 模式（打這些字切換，會記住）：\n"
-    "• 教學 → 排學習計畫，照主題每天教你單字\n"
-    "　（打「繼續」學下一個、「換主題」換方向）\n"
-    "• 文法 → 文法教學\n"
-    "• 考試 → 用你學過的單字考你計分\n"
-    "• 聊天 → 一般家教\n\n"
-    "⚡ 指令（隨時可用）：\n"
-    "• /翻譯 句子　• /文法 句子　• /單字\n"
-    "• /記 單字 中文　• /今天　• /複習\n\n"
-    "💡 隨時打「選單」可再看到這份說明。"
+# 一般股票教育家教
+TUTOR = (
+    "你是務實的台股投資「教育」導師，對象是認真學習、會看書做功課的散戶。"
+    "用繁體中文，把觀念講清楚、給白話例子。"
+    "重要界線：只做觀念教學與思路引導，絕不報明牌、不預測特定個股漲跌、不給買賣點。"
+    f"若被要求報明牌就婉拒並把問題導回『可驗證的規則』。{SHORT}"
 )
 
+
+# ---------- 「學一課」：教一個觀念 + 出題 ----------
+LESSON_TOPICS = [
+    "月營收 YoY 與股價的關係", "均線多頭排列的意義與陷阱", "成交量與價格的配合",
+    "三大法人買賣超怎麼看才不會被騙", "融資融券透露的散戶情緒", "集保大戶持股比例的訊號",
+    "毛利率與營益率看什麼", "本益比 / 股價淨值比的適用與誤用", "停損與部位控制為何比選股重要",
+    "產業供應鏈與題材輪動", "營收認列與旺淡季的季節性", "突破新高 vs 追高的差別",
+]
+
+
+def teach_lesson(user):
+    # 用已上過的課數決定教哪一課，循序不重複
+    done = count_hypotheses(user)  # 借用計數當輪替種子即可
+    topic = LESSON_TOPICS[done % len(LESSON_TOPICS)]
+    sys = (
+        f"你是台股投資教育導師。用繁體中文教『{topic}』這個觀念，"
+        "結構：①一句話定義 ②為什麼重要 ③一個台股情境例子 ④最常見的誤用/陷阱。"
+        f"最後用一行『🤔 想想看：』出 1 個開放式問題讓學生思考（不要給答案）。{SHORT}"
+    )
+    body = ask_gemini(sys, f"教我：{topic}")
+    add_lesson(user, {"source_type": "daily_lesson", "title": topic,
+                      "ai_explanation": body[:2000], "user_understanding": "",
+                      "created_at": tw_now()})
+    return f"📘 今日一課：{topic}\n\n{body}\n\n（有想法就打「想法：…」記下來）\n{DISCLAIMER}"
+
+
+# ---------- 「筆記：」讀書心得整理 ----------
+def handle_note(user, body):
+    if not body:
+        return "用法：筆記：我今天看第3章毛利率，我理解是……\n（我幫你整理成學習筆記存起來）"
+    sys = (
+        "你是投資讀書筆記整理員。使用者給一段讀書心得，請你："
+        "①用 2-4 句整理他的『理解重點』（用他的話，不要照抄整本書）"
+        "②指出 1 個他可能還不確定或需要查證的地方。"
+        "不要長篇，不要幫他下結論。繁體中文。"
+    )
+    tidy = ask_gemini(sys, body)
+    add_lesson(user, {"source_type": "book_note", "title": body[:30],
+                      "ai_explanation": "", "user_understanding": body[:2000],
+                      "corrected_note": tidy[:2000], "created_at": tw_now()})
+    return f"📝 已存成學習筆記：\n\n{tidy}\n\n（若這心得能變成可驗證規則，改打「想法：…」）\n{DISCLAIMER}"
+
+
+# ---------- 「想法：」核心 —— 分類 A/B/C/D + 轉假設 JSON ----------
+CLASSIFY_SYS = f"""你是量化投資研究助理。使用者給一個從書上/觀察得到的投資「想法」。
+你的工作是把它分類，並且【只在可回測時】轉成結構化假設，交給程式做歷史回測。
+
+分類定義：
+A = 可直接回測（條件明確、用得到下列資料欄位）
+B = 需要補條件才可回測（方向對，但缺門檻/期間/定義）
+C = 只是好觀念，適合放進檢查表，不適合回測
+D = 太模糊，先不要用
+
+{DATA_FIELDS}
+
+【最重要的防污染規則】
+- 規則只能用「進場當下就能知道」的資訊，嚴禁使用任何要事後才知道的結果。
+- 不可把「你知道後來哪些股票漲了」的特徵偷偷寫進條件（避免倖存者/未來函數偏誤）。
+- 若想法本身依賴事後結果（例如「找出會漲的股票」），一律標為 D。
+- 不要指名任何個股，只描述『可套用到全市場的規則』。
+
+請「只」輸出一個 JSON（前後不要有多餘文字），格式：
+{{
+  "category": "A/B/C/D 其中一個",
+  "reason": "一句話說明為何這樣分類（繁中）",
+  "followup": "若是 B，問使用者需要補的 1 個關鍵條件；其他類填空字串",
+  "hypothesis": {{
+     "hypothesis": "用一句話寫出可檢驗的假設（繁中）",
+     "market": "TW",
+     "universe": "listed_and_otc",
+     "entry_rules": [ {{"field": "欄位名", "operator": ">/>=/</<=/==", "value": 數字或欄位名, "unit": "percent/張/日 等(可省)"}} ],
+     "exit_rules":  [ {{"field": "holding_days", "operator": ">=", "value": 20}} ],
+     "risk_rules":  [ {{"field": "stop_loss_pct", "operator": "<=", "value": 12}} ],
+     "metrics": ["total_return","avg_return","win_rate","max_drawdown","trade_count"],
+     "avoid_lookahead_bias": true
+  }}
+}}
+若 category 是 C 或 D，hypothesis 整個填 null。"""
+
+
+def handle_idea(user, body):
+    if not body:
+        return ("用法：想法：書裡說連續3個月營收成長的股票比較會漲，我想驗證……\n"
+                "我會幫你分類 A/B/C/D，可回測的就轉成假設存起來。")
+    raw = ask_gemini(CLASSIFY_SYS, f"想法：{body}", temp=0.3)
+    data = extract_json(raw)
+    if not data:
+        return f"⚠️ 分類時沒抓到結構，AI 原回覆：\n{raw[:400]}\n\n請換句話再說一次這個想法。"
+
+    cat = (data.get("category") or "D").strip()[:1].upper()
+    reason = data.get("reason", "")
+    followup = data.get("followup", "")
+    hyp = data.get("hypothesis")
+
+    cat_label = {"A": "🟢 A 可直接回測", "B": "🟡 B 需補條件",
+                 "C": "🔵 C 觀念/檢查表", "D": "⚪ D 太模糊"}.get(cat, "⚪ D")
+
+    # A / B：存成假設 + 產生 JSON 檔內容
+    if cat in ("A", "B") and hyp:
+        seq = count_hypotheses(user) + 1
+        hid = f"HYP-{seq:04d}"
+        hyp["id"] = hid
+        rule_json = json.dumps(hyp, ensure_ascii=False)
+        add_hypothesis(user, {
+            "hypothesis_id": hid, "hypothesis": hyp.get("hypothesis", body[:200]),
+            "category": cat, "status": "draft", "rule_json": rule_json,
+            "source_idea": body[:500], "created_at": tw_now(),
+        })
+        msg = [f"{cat_label}　{hid}", f"💡 {hyp.get('hypothesis','')}", f"（{reason}）"]
+        if cat == "B" and followup:
+            msg.append(f"\n❓ 還需要你補：{followup}\n補完再打一次「想法：…」會更準。")
+        msg.append(f"\n已存進假設表 ✅ 週日打「整理本週」可匯出給 Codex 回測。")
+        msg.append(DISCLAIMER)
+        return "\n".join(msg)
+
+    # C / D：只給回饋，不存假設（C 可存成檢查表 lesson）
+    if cat == "C":
+        add_lesson(user, {"source_type": "checklist", "title": body[:30],
+                          "user_understanding": body[:500], "corrected_note": reason,
+                          "created_at": tw_now()})
+        return f"{cat_label}\n{reason}\n\n已收進『觀念檢查表』。這類不適合回測，但選股時可拿來檢查。\n{DISCLAIMER}"
+    return (f"{cat_label}\n{reason}\n\n這個想法太模糊、還不能驗證。"
+            f"試著加上『明確門檻＋期間＋用哪個資料欄位』再說一次，例如："
+            f"『連續3個月營收YoY>20%且股價站上季線』。\n{DISCLAIMER}")
+
+
+# ---------- 「整理本週」weekly_review ----------
+REVIEW_PROMPT = """——————————
+📋 複製下面整段丟給 GPT / Codex：
+
+你是投資教育複核員兼量化研究助理。請檢查我這週的學習筆記與假設 JSON：
+1. 找出錯誤、過度簡化、危險推論，並改寫成更精準版本
+2. 標出哪些只是觀念不能回測、哪些可轉成明確回測規則
+3. 檢查每個 rule_json 是否偷看未來資料（look-ahead / 倖存者偏誤）
+4. 補上缺少的資料欄位或門檻
+5. 產生修正版 hypotheses JSON
+6. 可回測的，請用「驗證引擎」資料夾的 cache_*.json + causal.db 寫回測程式並跑
+限制：不報明牌、不給買賣建議、不憑空想像回測結果；結果必須由程式讀歷史資料算出；資料不足要明講缺什麼。"""
+
+
+def handle_weekly(user):
+    # 取本週一以來的紀錄
+    today = datetime.datetime.now(TW).date()
+    monday = (today - datetime.timedelta(days=today.weekday())).isoformat()
+    lessons = list_since(user, "lessons", monday)
+    hyps = list_since(user, "hypotheses", monday)
+
+    if not lessons and not hyps:
+        return "這週還沒有紀錄。先打「想法：…」或「筆記：…」累積幾筆，週日再來「整理本週」。"
+
+    lines = [f"# 每週股票學習複核（{monday} ~ {today.isoformat()}）", ""]
+    lines.append(f"## 本週學習筆記（{len(lessons)} 筆）")
+    for r in lessons:
+        t = r.get("title", "")
+        note = r.get("corrected_note") or r.get("ai_explanation") or r.get("user_understanding", "")
+        lines.append(f"- 【{r.get('source_type','')}】{t}：{note[:120]}")
+    lines.append("")
+    lines.append(f"## 候選回測假設（{len(hyps)} 筆）")
+    for r in hyps:
+        lines.append(f"### {r.get('hypothesis_id','')}（{r.get('category','')}）")
+        lines.append(f"- 假設：{r.get('hypothesis','')}")
+        lines.append(f"- rule_json：{r.get('rule_json','')}")
+    md = "\n".join(lines)
+
+    # LINE 單則有長度限制，太長就只回摘要 + 提示去試算表看
+    head = f"🗓 本週複核：筆記 {len(lessons)} 筆、假設 {len(hyps)} 筆\n"
+    full = head + "\n" + md + "\n" + REVIEW_PROMPT
+    if len(full) > 4500:
+        return (head + "（內容較長，完整 weekly_review 已在試算表 hypotheses/lessons 分頁，"
+                "把可回測的 rule_json 貼進『驗證引擎/hypotheses/』資料夾給 Codex 即可）\n\n"
+                + REVIEW_PROMPT)
+    return full
+
+
+# ---------- 說明文字 ----------
 WELCOME = (
-    "👋 歡迎使用「多益學習小助手」！\n"
-    "我會幫你排學習計畫、照主題每天教你單字，還會自動記錄、幫你考試 📚\n\n"
-    "🔤 打這些字切換模式（會記住）：\n"
-    "• 教學 → 排計畫學單字（我先問你主題和一天幾個）\n"
-    "• 文法 → 教你多益文法\n"
-    "• 考試 → 用你學過的字考你、算分\n"
-    "• 聊天 → 一般英文家教，什麼都能問\n\n"
-    "🔁 學單字時：打「繼續」接下一個、「換主題」換方向\n"
-    "⚡ 指令：/翻譯 句子　/單字　/今天　/複習\n\n"
-    "💡 現在就打「教學」開始排你的計畫吧！\n"
-    "（隨時打「操作手冊」看完整教學）"
+    "👋 歡迎使用「股票學習導師」！\n"
+    "我不是報明牌工具，是幫你把『看書的想法』變成『可驗證的假設』的學習夥伴 📚\n\n"
+    "🧭 三個主要用法：\n"
+    "• 想法：<一句話> → 我分類 A/B/C/D，可回測的就轉成假設存起來\n"
+    "• 筆記：<讀書心得> → 幫你整理成學習筆記\n"
+    "• 整理本週 → 產出週複核，附一段可直接丟 GPT/Codex 的 prompt\n\n"
+    "📘 打「學一課」→ 每次教你一個投資觀念\n"
+    "💬 其他時候直接問我股票觀念就好（我只教觀念、不報明牌）\n\n"
+    "💡 隨時打「操作手冊」看完整說明。\n" + DISCLAIMER
+)
+
+HELP = (
+    "🧭 用法：\n"
+    "• 想法：<想法> → 分類+轉可回測假設\n"
+    "• 筆記：<心得> → 整理成學習筆記\n"
+    "• 整理本週 → 週複核 + 給 Codex 的 prompt\n"
+    "• 學一課 → 教一個觀念\n"
+    "• 直接發問 → 一般股票教育問答\n\n"
+    "💡 打「選單」看歡迎說明、「操作手冊」看完整教學。"
 )
 
 MANUAL = (
-    "📖 操作手冊 ─ 多益學習小助手\n"
+    "📖 操作手冊 ─ 股票學習導師\n"
     "━━━━━━━━━━━━━━\n"
-    "用法只有兩種：①打「模式」的名字切換　②打「/指令」\n\n"
-
-    "【① 四種模式】打名字就切換，會一直記住\n\n"
-    "▎教學（幫你排計畫學單字）\n"
-    "打「教學」→ 我問你想學的主題→ 再問一天幾個→ 開始一個一個教，還會自動幫你記起來。\n"
-    "　例：\n"
-    "　你：教學\n"
-    "　我：想學什麼主題？\n"
-    "　你：出國旅遊\n"
-    "　我：一天幾個？\n"
-    "　你：5\n"
-    "　我：📖 destination 目的地…（第1/5個）\n"
-    "　你：繼續 → 教下一個\n"
-    "　• 隔天再打「繼續」就接著學，主題不會跑掉\n"
-    "　• 想換方向 → 打「換主題」\n"
-    "　• 當天想多學 → 打「更多」\n\n"
-    "▎文法\n"
-    "打「文法」→ 貼一句英文我幫你抓文法重點；打「下一個」教你新的多益文法點。\n\n"
-    "▎考試\n"
-    "打「考試」→ 用你學過的單字考你，直接打英文作答、即時算分；打「結束」看成績。\n\n"
-    "▎聊天\n"
-    "打「聊天」→ 一般英文家教，任何問題都能問。\n\n"
-
-    "【② 隨時能用的指令】記得加斜線 /\n"
-    "• /翻譯 我明天開會 → 中英互譯\n"
-    "• /文法 一句英文 → 看這句的文法\n"
-    "• /單字 → 隨機一個多益單字\n"
-    "• /記 apple 蘋果 → 手動記一個字\n"
-    "• /今天 → 看今天學了哪些\n"
-    "• /複習 → 智慧複習：優先考到期、常錯的字；答對拉長間隔、答錯隔天再考\n\n"
-
-    "【小提醒】\n"
-    "• 每個人資料分開，朋友加同一個 bot 也不會混在一起\n"
-    "• 剛睡醒的第一句可能慢 30 秒，之後就快了\n"
-    "• 隨時打「操作手冊」或「選單」看說明"
+    "這套的核心是：看書想法 → 記下來 → AI 幫你變成可回測的規則 → 週日交給 GPT/Codex 用歷史資料驗證。\n\n"
+    "【① 想法：】最重要\n"
+    "打「想法：」再接一句你看書得到的點子，例如：\n"
+    "　想法：連續3個月營收YoY超過20%的股票，站上季線後比較會續漲\n"
+    "我會回你：\n"
+    "　🟢A 可直接回測 / 🟡B 需補條件 / 🔵C 檢查表 / ⚪D 太模糊\n"
+    "可回測的會自動存成假設（HYP-0001…），並產生 rule_json。\n"
+    "→ B 類我會問你缺哪個門檻，補完再打一次會更完整。\n\n"
+    "【② 筆記：】\n"
+    "打「筆記：」接讀書心得，我幫你整理重點、點出要查證的地方，存進 lessons。\n\n"
+    "【③ 整理本週】\n"
+    "週日打「整理本週」→ 我把這週的筆記與假設整理成 weekly_review，\n"
+    "並附一段可直接複製給 GPT / Codex 的複核 prompt。\n"
+    "把可回測的 rule_json 放進『驗證引擎/hypotheses/』，叫 Codex 用 cache 資料回測即可。\n\n"
+    "【④ 學一課 / 一般問答】\n"
+    "打「學一課」每次教一個觀念；其他時候直接問股票觀念。\n\n"
+    "【界線】只做投資教育與研究，不報明牌、不給買賣建議。\n" + DISCLAIMER
 )
-
-SWITCH = {
-    "grammar": {"文法", "文法模式", "學文法"},
-    "translate": {"翻譯", "翻譯模式"},
-    "exam": {"考試", "測驗", "考我"},
-    "chat": {"聊天", "一般", "回家教", "家教"},
-}
-
-PLAN_ENTER = {"教學", "學單字", "背單字", "單字教學", "計畫", "學習計畫", "排課"}
-PLAN_NEXT = {"繼續", "下一個", "next", "繼續學", "再一個"}
-PLAN_MORE = {"更多", "多學", "再多一個", "加碼"}
-PLAN_RESET = {"換主題", "重新設定", "換方向", "重設計畫"}
 
 
 # ---------- 路由 ----------
+def strip_prefix(s, prefixes):
+    for p in prefixes:
+        if s.startswith(p):
+            return s[len(p):].lstrip("：: ").strip()
+    return None
+
+
 def route(text, user):
     s = text.strip()
 
-    # 1) 斜線指令：任何模式都能用
-    if s.startswith("/翻譯"):
-        b = s[3:].strip()
-        return ask_gemini(TRANSLATE, b) if b else "用法：/翻譯 你想翻譯的句子"
-    if s.startswith("/文法"):
-        b = s[3:].strip()
-        return ask_gemini(GRAMMAR_ONE, b) if b else "用法：/文法 一句英文"
-    if s.startswith("/單字"):
-        return cmd_word()
-    if s.startswith("/記"):
-        return cmd_record(user, s[2:].strip())
-    if s.startswith("/今天"):
-        return cmd_today(user)
-    if s.startswith("/複習") or s in ("複習", "智慧複習"):
-        return start_review(user)
-    if s in ("/help", "/說明", "help", "?"):
+    # 指令 / 說明
+    if s in ("/help", "help", "?", "說明"):
         return HELP
     if s in ("選單", "開始", "menu", "使用說明", "怎麼用"):
         return WELCOME
-    if s in ("操作手冊", "手冊", "說明書", "教學手冊", "怎麼玩", "使用手冊"):
+    if s in ("操作手冊", "手冊", "說明書", "教學手冊", "使用手冊"):
         return MANUAL
 
-    # 2) 進入學習計畫（教學）
-    if s in PLAN_ENTER:
-        return enter_plan(user)
+    # 想法：/ 筆記：
+    idea = strip_prefix(s, ("想法", "點子", "假設"))
+    if idea is not None:
+        return handle_idea(user, idea)
+    note = strip_prefix(s, ("筆記", "讀書筆記", "心得"))
+    if note is not None:
+        return handle_note(user, note)
 
-    # 3) 模式切換（整句剛好是關鍵字才切換）
-    for mode, kws in SWITCH.items():
-        if s in kws:
-            if mode == "exam":
-                return start_exam(user)
-            set_state(user, mode, "")
-            names = {"grammar": "文法教學", "translate": "翻譯", "chat": "一般家教"}
-            tip = {"grammar": "貼一句英文我幫你看文法，或打「下一個」教你新重點。",
-                   "translate": "直接打中文或英文，我就幫你翻譯並點重點。",
-                   "chat": "有什麼英文問題都可以問我。"}[mode]
-            return f"已切換到「{names[mode]}」模式 ✅\n{tip}\n（打「教學」「考試」等可再切換）"
+    # 整理本週
+    if s in ("整理本週", "本週", "週複核", "整理這週", "weekly"):
+        return handle_weekly(user)
 
-    # 4) 依目前模式處理
-    mode, pending = get_state(user)
+    # 學一課
+    if s in ("學一課", "今天學一課", "教我一課", "上課", "一課"):
+        return teach_lesson(user)
 
-    if mode == "setup":
-        return handle_setup(user, s, pending)
+    # 模式切換
+    if s in ("導師", "聊天", "問答", "一般"):
+        set_state(user, "chat", "")
+        return "已回到一般教育問答，直接問我股票觀念就好（我只教觀念、不報明牌）。"
 
-    if mode == "exam":
-        if s in ("結束", "停", "stop", "退出"):
-            return end_exam(user, pending)
-        return exam_answer(user, s, pending)
-
-    if mode == "review":
-        if s in ("結束", "停", "stop", "退出"):
-            return end_review(user, pending)
-        return review_answer(user, s, pending)
-
-    if mode == "plan":
-        plan = parse_json(pending)
-        if s in PLAN_RESET:
-            set_state(user, "setup", json.dumps({"step": "theme"}))
-            return "好，換主題！告訴我新的主題或方向（例如：出國旅遊 / 字首 pre-）👇"
-        if s in PLAN_MORE:
-            return plan_continue(user, plan, force=True)
-        return plan_continue(user, plan)   # 繼續 或其他任何輸入 → 教下一個
-
-    if s in PLAN_NEXT or s in PLAN_MORE or s in PLAN_RESET:
-        return "你還沒有學習計畫，打「教學」開始排一個 📚"
-
-    if mode == "grammar":
-        return grammar_teach(s)
-    if mode == "translate":
-        return ask_gemini(TRANSLATE, s)
-    return ask_gemini(TUTOR, s)  # chat
+    # 預設：一般股票教育問答
+    return ask_gemini(TUTOR, s)
 
 
 # ---------- LINE Webhook ----------
@@ -658,16 +450,15 @@ def callback():
 
 
 def to_messages(result):
-    """route() 可能回傳文字、Flex 卡片(dict)、或它們的列表 → 轉成 LINE 訊息物件。"""
     items = result if isinstance(result, list) else [result]
     msgs = []
     for it in items:
         if isinstance(it, dict) and it.get("flex"):
-            msgs.append(FlexMessage(alt_text=it.get("alt", "單字卡"),
+            msgs.append(FlexMessage(alt_text=it.get("alt", "訊息"),
                                     contents=FlexContainer.from_dict(it["flex"])))
         else:
-            msgs.append(TextMessage(text=str(it)))
-    return msgs[:5]  # LINE 一次最多 5 則
+            msgs.append(TextMessage(text=str(it)[:4900]))
+    return msgs[:5]
 
 
 @handler.add(MessageEvent, message=TextMessageContent)
@@ -683,20 +474,18 @@ def on_message(event):
 
 @handler.add(FollowEvent)
 def on_follow(event):
-    """有人加 bot 好友時，自動送上使用說明。"""
     with ApiClient(configuration) as api_client:
         MessagingApi(api_client).reply_message(
             ReplyMessageRequest(reply_token=event.reply_token,
-                                messages=[TextMessage(text=WELCOME),
-                                          TextMessage(text=MANUAL)])
+                                messages=[TextMessage(text=WELCOME)])
         )
 
 
 @app.route("/")
 def health():
-    return "LINE English Bot is running."
+    return "LINE Stock Tutor is running."
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5001))
+    port = int(os.environ.get("PORT", 5002))
     app.run(host="0.0.0.0", port=port)
